@@ -1,6 +1,6 @@
 {
 	"id": "github-sync",
-	"name": "GitHub Sync",
+	"name": "Github One-Way Sync",
 	"version": "1.0.7",
 	"minAppVersion": "0.15.0",
 	"description": "Sync vault to personal GitHub.",

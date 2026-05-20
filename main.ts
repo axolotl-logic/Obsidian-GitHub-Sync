@@ -1,9 +1,52 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, Vault } from 'obsidian';
 import { simpleGit, SimpleGit, CleanOptions, SimpleGitOptions } from 'simple-git';
 import { setIntervalAsync, clearIntervalAsync } from 'set-interval-async';
+import { promises as fsp } from 'fs';
+import * as path from 'path';
 
 let simpleGitOptions: Partial<SimpleGitOptions>;
 let git: SimpleGit;
+
+async function pathExists(p: string): Promise<boolean> {
+	try {
+		await fsp.access(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// Recursively mirror src → dst: copies new/changed files, deletes entries in
+// dst that don't exist in src. Skips any `.git` entry as a safety net so we
+// never clobber the clone's git metadata.
+async function mirrorDirectory(src: string, dst: string): Promise<void> {
+	await fsp.mkdir(dst, { recursive: true });
+	const srcEntries = await fsp.readdir(src, { withFileTypes: true });
+	const dstEntries = await fsp.readdir(dst, { withFileTypes: true }).catch(() => [] as Awaited<ReturnType<typeof fsp.readdir>>);
+
+	const srcNames = new Set(srcEntries.map(e => e.name));
+	for (const entry of dstEntries) {
+		if (entry.name === '.git') continue;
+		if (!srcNames.has(entry.name)) {
+			await fsp.rm(path.join(dst, entry.name), { recursive: true, force: true });
+		}
+	}
+
+	for (const entry of srcEntries) {
+		if (entry.name === '.git') continue;
+		const srcPath = path.join(src, entry.name);
+		const dstPath = path.join(dst, entry.name);
+		if (entry.isDirectory()) {
+			await mirrorDirectory(srcPath, dstPath);
+		} else if (entry.isSymbolicLink()) {
+			const link = await fsp.readlink(srcPath);
+			await fsp.rm(dstPath, { force: true }).catch(() => {});
+			await fsp.symlink(link, dstPath);
+		} else if (entry.isFile()) {
+			await fsp.copyFile(srcPath, dstPath);
+		}
+	}
+}
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -18,6 +61,8 @@ interface GHSyncSettings {
 	checkStatusOnLoad: boolean;
 	noticeLevel: NoticeLevelSetting;
 	showSyncSuccessNotice: boolean;
+	localRepoPath: string;
+	vaultSubdirectory: string;
 }
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
@@ -28,6 +73,8 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	checkStatusOnLoad: true,
 	noticeLevel: 'ALL',
 	showSyncSuccessNotice: true,
+	localRepoPath: '',
+	vaultSubdirectory: '',
 }
 
 
@@ -67,10 +114,45 @@ export default class GHSyncPlugin extends Plugin {
 	async SyncNotes()
 	{
 		const remote = this.settings.remoteURL.trim();
+		//@ts-ignore
+		const vaultPath: string = this.app.vault.adapter.getBasePath();
+		const localRepoPath = this.settings.localRepoPath.trim();
+		const useMonorepoMode = localRepoPath.length > 0;
+		const subdir = this.settings.vaultSubdirectory.trim().replace(/^[\/\\]+|[\/\\]+$/g, '');
+		const repoBaseDir = useMonorepoMode ? localRepoPath : vaultPath;
+		// path inside the repo working tree where vault contents live
+		const repoSubdirAbs = subdir.length > 0 ? path.join(repoBaseDir, subdir) : repoBaseDir;
+		// what we pass to `git add` — relative to repoBaseDir
+		const addPath = subdir.length > 0 ? subdir : './*';
+
+		// In monorepo mode, make sure the clone exists before doing anything else.
+		if (useMonorepoMode) {
+			if (!remote) {
+				this.showNotice("Set the Remote URL before syncing in monorepo mode.", 'ERROR', 10000);
+				return;
+			}
+			const repoGitDir = path.join(localRepoPath, '.git');
+			if (!(await pathExists(repoGitDir))) {
+				try {
+					await fsp.mkdir(localRepoPath, { recursive: true });
+					await simpleGit({ binary: this.settings.gitLocation + "git" })
+						.clone(remote, localRepoPath);
+				} catch (e) {
+					this.showNotice("GitHub Sync: failed to clone remote into local repo path.\n" + String(e), 'ERROR', 10000);
+					return;
+				}
+			}
+			// Mirror vault → repo subdir so commits below pick up vault changes.
+			try {
+				await mirrorDirectory(vaultPath, repoSubdirAbs);
+			} catch (e) {
+				this.showNotice("GitHub Sync: failed to copy vault into repo subdirectory.\n" + String(e), 'ERROR', 10000);
+				return;
+			}
+		}
 
 		simpleGitOptions = {
-			//@ts-ignore
-		    baseDir: this.app.vault.adapter.getBasePath(),
+		    baseDir: repoBaseDir,
 		    binary: this.settings.gitLocation + "git",
 		    maxConcurrentProcesses: 6,
 		    trimmed: false,
@@ -94,12 +176,12 @@ export default class GHSyncPlugin extends Plugin {
     	let date = new Date();
     	let msg = hostname + " " + date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate() + ":" + date.getHours() + ":" + date.getMinutes() + ":" + date.getSeconds();
 
-		// git add .
+		// git add <addPath>
 		// git commit -m hostname-date-time
 		if (!clean) {
 			try {
 				await git
-		    		.add("./*")
+		    		.add(addPath)
 		    		.commit(msg);
 		    } catch (e) {
 		    	this.showNotice(e, 'ERROR', 10000);
@@ -124,7 +206,9 @@ export default class GHSyncPlugin extends Plugin {
 			return;
 		}
 
-		// git pull origin main
+		// git pull origin main — needed so push isn't rejected as non-fast-forward.
+		// One-way intent: we never mirror remote changes back into the vault, so
+		// the next sync's vault→subdir mirror will overwrite anything pulled here.
 	    try {
 	    	//@ts-ignore
 	    	await git.pull('origin', 'main', { '--no-rebase': null }, (err, update) => {
@@ -142,15 +226,23 @@ export default class GHSyncPlugin extends Plugin {
 			}
 			conflictMsg += "\nResolve them or click sync button again to push with unresolved conflicts."
 			this.showNotice(conflictMsg, 'WARNING');
-			//@ts-ignore	
+			//@ts-ignore
 			for (let c of conflictStatus.conflicted)
 			{
-				this.app.workspace.openLinkText("", c, true);
+				// Translate conflict paths back to vault-relative so openLinkText
+				// finds the right note in the open vault.
+				let vaultRelative = c;
+				if (useMonorepoMode && subdir.length > 0) {
+					const rel = path.relative(subdir, c);
+					if (!rel.startsWith('..')) {
+						vaultRelative = rel;
+					}
+				}
+				this.app.workspace.openLinkText("", vaultRelative, true);
 			}
 	    	return;
 	    }
 
-		// resolve merge conflicts
 		// git push origin main
 	    if (!clean) {
 		    try {
@@ -168,9 +260,12 @@ export default class GHSyncPlugin extends Plugin {
 	{
 		// check status
 		try {
+			const localRepoPath = this.settings.localRepoPath.trim();
+			//@ts-ignore
+			const vaultPath: string = this.app.vault.adapter.getBasePath();
+			const repoBaseDir = localRepoPath.length > 0 ? localRepoPath : vaultPath;
 			simpleGitOptions = {
-				//@ts-ignore
-			    baseDir: this.app.vault.adapter.getBasePath(),
+			    baseDir: repoBaseDir,
 			    binary: this.settings.gitLocation + "git",
 			    maxConcurrentProcesses: 6,
 			    trimmed: false,
@@ -307,6 +402,30 @@ class GHSyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				})
         	.inputEl.addClass('my-plugin-setting-text2'));
+
+		new Setting(containerEl)
+			.setName('Local repo path')
+			.setDesc('Absolute path where this plugin keeps a clone of your remote repo. Leave empty to treat the vault itself as the repo (legacy mode). Set this when syncing into a subdirectory of a larger repo (e.g., a Quartz site).')
+			.addText(text => text
+				.setPlaceholder('')
+				.setValue(this.plugin.settings.localRepoPath)
+				.onChange(async (value) => {
+					this.plugin.settings.localRepoPath = value;
+					await this.plugin.saveSettings();
+				})
+			.inputEl.addClass('my-plugin-setting-text'));
+
+		new Setting(containerEl)
+			.setName('Vault subdirectory')
+			.setDesc('Path inside the repo where vault contents should live (e.g., "content" for Quartz). Leave empty to use the repo root. Only used when Local repo path is set.')
+			.addText(text => text
+				.setPlaceholder('')
+				.setValue(this.plugin.settings.vaultSubdirectory)
+				.onChange(async (value) => {
+					this.plugin.settings.vaultSubdirectory = value;
+					await this.plugin.saveSettings();
+				})
+			.inputEl.addClass('my-plugin-setting-text'));
 
 		new Setting(containerEl)
 			.setName('Notice level')
